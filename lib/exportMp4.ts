@@ -1,109 +1,89 @@
-"use client";
+'use client';
 
-import { createFFmpeg, fetchFile } from "@ffmpeg/ffmpeg";
-import { toBlobURL } from "@ffmpeg/util";
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
-/**
- * Professional export path (client-side):
- * 1) Render frames from a canvas at 30fps
- * 2) Use ffmpeg.wasm to:
- *    - build video from frames
- *    - trim audio between start/end
- *    - mux audio + video into mp4
- *
- * Notes:
- * - This is heavy on mobile. Consider adding server-side rendering later.
- * - CORS: audioUrl must allow cross-origin fetch for ffmpeg to read it.
- */
+let ffmpeg: FFmpeg | null = null;
+let ffmpegLoaded = false;
+
+async function getFFmpeg(onProgress?: (p: number) => void) {
+  if (!ffmpeg) {
+    ffmpeg = new FFmpeg();
+    if (onProgress) {
+      ffmpeg.on('progress', ({ progress }) => {
+        onProgress(Math.max(0, Math.min(1, progress)));
+      });
+    }
+  }
+
+  if (!ffmpegLoaded) {
+    // Load ffmpeg core in the browser (from CDN). Versions must match the @ffmpeg/core build.
+    const coreBase = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+
+    const coreURL = await toBlobURL(`${coreBase}/ffmpeg-core.js`, 'text/javascript');
+    const wasmURL = await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, 'application/wasm');
+
+    await ffmpeg.load({ coreURL, wasmURL });
+    ffmpegLoaded = true;
+  }
+
+  return ffmpeg;
+}
 
 export async function exportMp4(opts: {
-  canvas: HTMLCanvasElement;
+  images: Blob[];        // ordered frames
+  audioBlob?: Blob;      // optional audio (mp3/wav)
   fps: number;
-  durationSec: number;
-  audioUrl: string;
-  startSec: number;
-  endSec: number;
   onProgress?: (p: number) => void;
-}) {
-  const { canvas, fps, durationSec, audioUrl, startSec, endSec, onProgress } = opts;
+}): Promise<Blob> {
+  const { images, audioBlob, fps, onProgress } = opts;
 
-  const ffmpeg = createFFmpeg({ log: false });
+  const inst = await getFFmpeg(onProgress);
 
-  // Load core from unpkg via blob URLs (works on Vercel).
-  if (!ffmpeg.isLoaded()) {
-    const coreBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
-    ffmpeg.setProgress(({ ratio }) => onProgress?.(Math.round(ratio * 100)));
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
-    });
+  // Clean any previous run files (best-effort)
+  try { await inst.deleteFile('out.mp4'); } catch {}
+  try { await inst.deleteFile('audio.mp3'); } catch {}
+
+  // Write frames
+  for (let i = 0; i < images.length; i++) {
+    const name = `frame_${String(i).padStart(4, '0')}.png`;
+    const data = await fetchFile(images[i]);
+    await inst.writeFile(name, data);
   }
 
-  const totalFrames = Math.max(1, Math.round(durationSec * fps));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("No canvas context");
-
-  // Render & write frames
-  for (let i = 0; i < totalFrames; i++) {
-    // Assume caller already draws the current frame into canvas.
-    // We just read pixels as PNG and write it.
-    const blob: Blob = await new Promise((res) => canvas.toBlob((b) => res(b!), "image/png"));
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    const name = `frame_${String(i).padStart(5, "0")}.png`;
-    ffmpeg.FS("writeFile", name, bytes);
-    onProgress?.(Math.round((i / totalFrames) * 40)); // 0..40
+  // Optional audio
+  if (audioBlob) {
+    await inst.writeFile('audio.mp3', await fetchFile(audioBlob));
   }
 
-  // Fetch audio
-  const audioData = await fetchFile(audioUrl);
-  ffmpeg.FS("writeFile", "full.mp3", audioData);
+  const inputPattern = 'frame_%04d.png';
 
-  // Build silent video from frames
-  await ffmpeg.run(
-    "-framerate", String(fps),
-    "-i", "frame_%05d.png",
-    "-c:v", "libx264",
-    "-pix_fmt", "yuv420p",
-    "-r", String(fps),
-    "video.mp4"
+  const args: string[] = [
+    '-framerate', String(fps),
+    '-i', inputPattern,
+  ];
+
+  if (audioBlob) {
+    args.push('-i', 'audio.mp3', '-shortest');
+  }
+
+  args.push(
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', 'faststart',
+    'out.mp4'
   );
-  onProgress?.(60);
 
-  // Trim audio
-  const segDur = Math.max(0.01, endSec - startSec);
-  await ffmpeg.run(
-    "-ss", String(startSec),
-    "-t", String(segDur),
-    "-i", "full.mp3",
-    "-c:a", "aac",
-    "-b:a", "192k",
-    "audio.m4a"
-  );
-  onProgress?.(80);
+  await inst.exec(args);
 
-  // Mux
-  await ffmpeg.run(
-    "-i", "video.mp4",
-    "-i", "audio.m4a",
-    "-c:v", "copy",
-    "-c:a", "aac",
-    "-shortest",
-    "out.mp4"
-  );
-  onProgress?.(95);
+  const out = await inst.readFile('out.mp4');
+  const blob = new Blob([out], { type: 'video/mp4' });
 
-  const out = ffmpeg.FS("readFile", "out.mp4");
-  const outBlob = new Blob([out.buffer], { type: "video/mp4" });
+  // Cleanup frames (best-effort)
+  for (let i = 0; i < images.length; i++) {
+    const name = `frame_${String(i).padStart(4, '0')}.png`;
+    try { await inst.deleteFile(name); } catch {}
+  }
 
-  // cleanup (best-effort)
-  try {
-    for (let i = 0; i < totalFrames; i++) ffmpeg.FS("unlink", `frame_${String(i).padStart(5, "0")}.png`);
-    ffmpeg.FS("unlink", "full.mp3");
-    ffmpeg.FS("unlink", "video.mp4");
-    ffmpeg.FS("unlink", "audio.m4a");
-    ffmpeg.FS("unlink", "out.mp4");
-  } catch {}
-
-  onProgress?.(100);
-  return outBlob;
+  return blob;
 }
