@@ -25,8 +25,8 @@ function isLikelyEnglish(s: string) {
   return /^O\sAllah\b|\bbless\b|\bMessenger\b/i.test(t);
 }
 
-export async function GET(_: Request, { params }: { params: { n: string } }) {
-  const n = Number(params.n);
+export async function GET(_: Request, ctx: any) {
+  const n = Number(ctx?.params?.n);
   if (!Number.isFinite(n) || n < 1 || n > 8) {
     return NextResponse.json({ error: "Invalid part number" }, { status: 400 });
   }
